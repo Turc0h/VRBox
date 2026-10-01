@@ -1,11 +1,10 @@
 use calamine::{Reader, open_workbook_auto};
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use eframe::egui::{self, Color32, RichText, Vec2};
 use rusqlite::{Connection, params};
 use rust_xlsxwriter::{Format, Formula, Workbook};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::{path::PathBuf, time::Duration};
-mod reservations;
 
 const RESOURCES: [(&str, &str); 12] = [
     ("Simulador plata 1", "sim_silver"),
@@ -20,16 +19,6 @@ const RESOURCES: [(&str, &str); 12] = [
     ("PS5 2", "play"),
     ("Realidad virtual 1", "vr"),
     ("Realidad virtual 2", "vr"),
-];
-const GAME_OPTIONS: [&str; 8] = [
-    "Assetto Corsa",
-    "F1",
-    "Forza",
-    "Gran Turismo",
-    "EA Sports FC",
-    "Mortal Kombat",
-    "Beat Saber",
-    "Otro",
 ];
 
 fn data_dir() -> PathBuf {
@@ -59,22 +48,8 @@ fn open_db() -> rusqlite::Result<Connection> {
            id INTEGER PRIMARY KEY, service_date TEXT NOT NULL, resource TEXT NOT NULL, customer TEXT NOT NULL,
            start_hour INTEGER NOT NULL, duration INTEGER NOT NULL, games TEXT NOT NULL DEFAULT '',
            total_cents INTEGER NOT NULL, discount_cents INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '',
-           status TEXT NOT NULL DEFAULT 'reservada', group_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           status TEXT NOT NULL DEFAULT 'reservada', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            UNIQUE(service_date, resource, start_hour));
-         CREATE TABLE IF NOT EXISTS reservation_groups(
-           id INTEGER PRIMARY KEY, service_date TEXT NOT NULL, customer TEXT NOT NULL,
-           start_hour INTEGER NOT NULL, station_count INTEGER NOT NULL, total_cents INTEGER NOT NULL,
-           promo_name TEXT NOT NULL DEFAULT '', discount_cents INTEGER NOT NULL DEFAULT 0,
-           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-         CREATE TABLE IF NOT EXISTS promotions(
-           id INTEGER PRIMARY KEY, name TEXT NOT NULL, buy_qty INTEGER NOT NULL CHECK(buy_qty >= 2),
-           pay_qty INTEGER NOT NULL CHECK(pay_qty >= 1 AND pay_qty < buy_qty),
-           start_hour INTEGER NOT NULL CHECK(start_hour BETWEEN 16 AND 23),
-           end_hour INTEGER NOT NULL CHECK(end_hour BETWEEN start_hour AND 23),
-           resource_kind TEXT NOT NULL DEFAULT 'all', active INTEGER NOT NULL DEFAULT 1);
-         CREATE TABLE IF NOT EXISTS timers(
-           id INTEGER PRIMARY KEY, resource TEXT NOT NULL, customer TEXT NOT NULL DEFAULT '',
-           started_at INTEGER NOT NULL, ends_at INTEGER NOT NULL, total_secs INTEGER NOT NULL CHECK(total_secs > 0));
          CREATE TABLE IF NOT EXISTS products(
            id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, price_cents INTEGER NOT NULL CHECK(price_cents >= 0),
            cost_cents INTEGER NOT NULL DEFAULT 0, margin_bps INTEGER NOT NULL DEFAULT 5000,
@@ -90,20 +65,6 @@ fn open_db() -> rusqlite::Result<Connection> {
            id INTEGER PRIMARY KEY, service_date TEXT NOT NULL UNIQUE, expected_cash INTEGER NOT NULL,
            expected_transfer INTEGER NOT NULL, counted_cash INTEGER NOT NULL, counted_transfer INTEGER NOT NULL,
            closed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, notes TEXT NOT NULL DEFAULT '');
-         CREATE TABLE IF NOT EXISTS reservation_payments(
-           id INTEGER PRIMARY KEY, group_id INTEGER REFERENCES reservation_groups(id),
-           reservation_id INTEGER REFERENCES reservations(id), amount_cents INTEGER NOT NULL CHECK(amount_cents > 0),
-           sale_id INTEGER NOT NULL UNIQUE REFERENCES sales(id),
-           kind TEXT NOT NULL CHECK(kind IN ('sena','saldo','parcial','devolucion')),
-           payment TEXT NOT NULL CHECK(payment IN ('efectivo','transferencia')),
-           service_date TEXT NOT NULL, paid_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-           CHECK((group_id IS NULL) != (reservation_id IS NULL)));
-         CREATE INDEX IF NOT EXISTS idx_reservation_payments_group ON reservation_payments(group_id);
-         CREATE INDEX IF NOT EXISTS idx_reservation_payments_single ON reservation_payments(reservation_id);
-         CREATE TABLE IF NOT EXISTS reservation_audit(
-           id INTEGER PRIMARY KEY, group_id INTEGER, reservation_id INTEGER, action TEXT NOT NULL,
-           details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-           CHECK((group_id IS NULL) != (reservation_id IS NULL)));
          CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);")?;
     for (_, kind) in RESOURCES {
         let key = format!("price_{kind}");
@@ -136,37 +97,6 @@ fn open_db() -> rusqlite::Result<Connection> {
             [],
         )?;
     }
-    let mut reservation_columns = conn.prepare("PRAGMA table_info(reservations)")?;
-    let reservation_existing = reservation_columns
-        .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    drop(reservation_columns);
-    if !reservation_existing.iter().any(|c| c == "group_id") {
-        conn.execute("ALTER TABLE reservations ADD COLUMN group_id INTEGER", [])?;
-    }
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_reservation_group_id ON reservations(group_id)",
-        [],
-    )?;
-    let mut group_columns = conn.prepare("PRAGMA table_info(reservation_groups)")?;
-    let group_existing = group_columns
-        .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
-    drop(group_columns);
-    if !group_existing.iter().any(|c| c == "promo_name") {
-        conn.execute(
-            "ALTER TABLE reservation_groups ADD COLUMN promo_name TEXT NOT NULL DEFAULT ''",
-            [],
-        )?;
-    }
-    if !group_existing.iter().any(|c| c == "discount_cents") {
-        conn.execute(
-            "ALTER TABLE reservation_groups ADD COLUMN discount_cents INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
     for index in 1..=6 {
         let _ = conn.execute(
             "UPDATE reservations SET resource=?1 WHERE resource=?2",
@@ -185,21 +115,6 @@ fn open_db() -> rusqlite::Result<Connection> {
             ],
         );
     }
-    conn.execute_batch(
-        "WITH ranked_reservations AS (
-           SELECT id,group_id,resource,service_date,total_cents,
-                  ROW_NUMBER() OVER (PARTITION BY resource,service_date,total_cents ORDER BY start_hour,id) AS rn
-           FROM reservations WHERE status='completada'
-         ), ranked_sales AS (
-           SELECT id,substr(item,1,instr(item,' — ')-1) AS resource,service_date,total_cents,payment,
-                  ROW_NUMBER() OVER (PARTITION BY substr(item,1,instr(item,' — ')-1),service_date,total_cents ORDER BY id) AS rn
-           FROM sales WHERE category='sesion' AND instr(item,' — ')>0
-         )
-         INSERT OR IGNORE INTO reservation_payments(group_id,reservation_id,amount_cents,sale_id,kind,payment,service_date)
-         SELECT r.group_id,CASE WHEN r.group_id IS NULL THEN r.id ELSE NULL END,s.total_cents,s.id,'saldo',s.payment,s.service_date
-         FROM ranked_reservations r JOIN ranked_sales s
-           ON s.resource=r.resource AND s.service_date=r.service_date AND s.total_cents=r.total_cents AND s.rn=r.rn;"
-    )?;
     conn.execute(
         "INSERT OR IGNORE INTO products(name,price_cents,stock) VALUES('Agua',150000,20)",
         [],
@@ -213,61 +128,6 @@ fn open_db() -> rusqlite::Result<Connection> {
 
 fn money(cents: i64) -> String {
     format!("${:.2}", cents as f64 / 100.0)
-}
-fn remaining_text(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    if seconds >= 3600 {
-        format!(
-            "{:02}:{:02}:{:02}",
-            seconds / 3600,
-            (seconds / 60) % 60,
-            seconds % 60
-        )
-    } else {
-        format!("{:02}:{:02}", seconds / 60, seconds % 60)
-    }
-}
-fn timer_ring(ui: &mut egui::Ui, remaining: i64, total: i64) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(116.0), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    let center = rect.center();
-    let radius = 43.0;
-    painter.circle_stroke(
-        center,
-        radius,
-        egui::Stroke::new(6.0_f32, Color32::from_rgb(43, 59, 77)),
-    );
-    let fraction = (remaining.max(0) as f32 / total.max(1) as f32).clamp(0.0, 1.0);
-    if fraction > 0.0 {
-        let segments = (64.0 * fraction).ceil().max(2.0) as usize;
-        let points = (0..=segments)
-            .map(|i| {
-                let angle = -std::f32::consts::FRAC_PI_2
-                    + std::f32::consts::TAU * fraction * i as f32 / segments as f32;
-                center + Vec2::new(angle.cos(), angle.sin()) * radius
-            })
-            .collect::<Vec<_>>();
-        let color = if remaining == 0 {
-            Color32::from_rgb(224, 106, 116)
-        } else if fraction < 0.2 {
-            Color32::from_rgb(235, 169, 94)
-        } else {
-            Color32::from_rgb(91, 203, 196)
-        };
-        painter.add(egui::Shape::line(points, egui::Stroke::new(6.0_f32, color)));
-    }
-    let text = if remaining == 0 {
-        "FINALIZADO".into()
-    } else {
-        remaining_text(remaining)
-    };
-    painter.text(
-        center,
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::FontId::proportional(18.0),
-        Color32::WHITE,
-    );
 }
 fn pesos_input(pesos: &str) -> i64 {
     pesos
@@ -303,7 +163,6 @@ struct Reservation {
     games: String,
     total: i64,
     status: String,
-    group_id: i64,
 }
 #[derive(Clone)]
 struct Product {
@@ -322,27 +181,6 @@ struct Event {
     customer: String,
 }
 
-#[derive(Clone)]
-struct Promotion {
-    id: i64,
-    name: String,
-    buy_qty: usize,
-    pay_qty: usize,
-    start_hour: i32,
-    end_hour: i32,
-    resource_kind: String,
-}
-
-#[derive(Clone)]
-struct GameTimer {
-    id: i64,
-    resource: String,
-    customer: String,
-    started_at: i64,
-    ends_at: i64,
-    total_secs: i64,
-}
-
 #[derive(PartialEq, Clone, Copy)]
 enum Page {
     Agenda,
@@ -350,8 +188,6 @@ enum Page {
     Sales,
     Products,
     Prices,
-    Promotions,
-    Timers,
     Closing,
     Events,
 }
@@ -362,7 +198,7 @@ struct VrBoxApp {
     day: String,
     message: String,
     customer: String,
-    selected_resources: BTreeSet<usize>,
+    resource_idx: usize,
     start_hour: i32,
     cart: BTreeMap<i64, i64>,
     product_name: String,
@@ -382,20 +218,6 @@ struct VrBoxApp {
     closing_note: String,
     pay_transfer: bool,
     session_game: String,
-    promo_name: String,
-    promo_buy: String,
-    promo_pay: String,
-    promo_start: i32,
-    promo_end: i32,
-    promo_kind: String,
-    timer_resource: String,
-    timer_customer: String,
-    timer_minutes: String,
-    editing_group_id: i64,
-    editing_reservation_id: i64,
-    reservation_payment_transfer: bool,
-    reservation_partial_amount: String,
-    pending_cancel: Option<(i64, i64)>,
 }
 
 impl VrBoxApp {
@@ -434,7 +256,7 @@ impl VrBoxApp {
             day: day.clone(),
             message: "Datos guardados localmente en este equipo.".into(),
             customer: String::new(),
-            selected_resources: BTreeSet::new(),
+            resource_idx: 0,
             start_hour: 16,
             cart: BTreeMap::new(),
             product_name: String::new(),
@@ -454,20 +276,6 @@ impl VrBoxApp {
             closing_note: String::new(),
             pay_transfer: false,
             session_game: "Sin clasificar".into(),
-            promo_name: String::new(),
-            promo_buy: "2".into(),
-            promo_pay: "1".into(),
-            promo_start: 16,
-            promo_end: 19,
-            promo_kind: "all".into(),
-            timer_resource: "PS5 1".into(),
-            timer_customer: String::new(),
-            timer_minutes: "30".into(),
-            editing_group_id: 0,
-            editing_reservation_id: 0,
-            reservation_payment_transfer: false,
-            reservation_partial_amount: String::new(),
-            pending_cancel: None,
         }
     }
     fn price_for_kind(&self, kind: &str) -> i64 {
@@ -478,157 +286,11 @@ impl VrBoxApp {
             })
             .ok()
             .and_then(|v| v.parse().ok())
-            .map(|v: i64| v.saturating_mul(100))
+            .map(|v: i64| v * 100)
             .unwrap_or(0)
     }
-    fn promotions(&self) -> Vec<Promotion> {
-        let mut stmt = match self.db.prepare("SELECT id,name,buy_qty,pay_qty,start_hour,end_hour,resource_kind FROM promotions WHERE active=1 ORDER BY start_hour,name") {
-            Ok(stmt) => stmt,
-            Err(_) => return Vec::new(),
-        };
-        stmt.query_map([], |r| {
-            Ok(Promotion {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                buy_qty: r.get::<_, i64>(2)? as usize,
-                pay_qty: r.get::<_, i64>(3)? as usize,
-                start_hour: r.get(4)?,
-                end_hour: r.get(5)?,
-                resource_kind: r.get(6)?,
-            })
-        })
-        .map(|it| it.filter_map(Result::ok).collect())
-        .unwrap_or_default()
-    }
-    fn game_timers(&self) -> Vec<GameTimer> {
-        let mut stmt = match self.db.prepare("SELECT id,resource,customer,started_at,ends_at,total_secs FROM timers ORDER BY ends_at") { Ok(stmt) => stmt, Err(_) => return Vec::new() };
-        stmt.query_map([], |r| {
-            Ok(GameTimer {
-                id: r.get(0)?,
-                resource: r.get(1)?,
-                customer: r.get(2)?,
-                started_at: r.get(3)?,
-                ends_at: r.get(4)?,
-                total_secs: r.get(5)?,
-            })
-        })
-        .map(|it| it.filter_map(Result::ok).collect())
-        .unwrap_or_default()
-    }
-    fn add_timer(&mut self) {
-        if !RESOURCES
-            .iter()
-            .any(|(name, kind)| *name == self.timer_resource && (*kind == "play" || *kind == "vr"))
-        {
-            self.message = "Elegí una estación PS5 o VR para iniciar el cronómetro.".into();
-            return;
-        }
-        let minutes = self.timer_minutes.parse::<i64>().unwrap_or(0);
-        if !(1..=1440).contains(&minutes) {
-            self.message = "La duración debe ser de 1 a 1440 minutos.".into();
-            return;
-        }
-        let now = Local::now().timestamp();
-        let running = self
-            .db
-            .query_row(
-                "SELECT COUNT(*) FROM timers WHERE resource=?1 AND ends_at>?2",
-                params![self.timer_resource, now],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
-        if running > 0 {
-            self.message = format!("{} ya tiene un cronómetro en curso.", self.timer_resource);
-            return;
-        }
-        let total = minutes * 60;
-        match self.db.execute("INSERT INTO timers(resource,customer,started_at,ends_at,total_secs) VALUES(?1,?2,?3,?4,?5)", params![self.timer_resource, self.timer_customer.trim(), now, now + total, total]) {
-            Ok(_) => { self.message = format!("Cronómetro iniciado para {}.", self.timer_resource); self.timer_customer.clear(); }
-            Err(e) => self.message = format!("No se pudo iniciar el cronómetro: {e}"),
-        }
-    }
-    fn adjust_timer(&mut self, id: i64, delta_minutes: i64) {
-        let now = Local::now().timestamp();
-        let result = self.db.execute("UPDATE timers SET ends_at=ends_at+?1,total_secs=MAX(60,total_secs+?1) WHERE id=?2 AND (?1>0 OR ends_at+?1>=?3)", params![delta_minutes * 60, id, now]);
-        self.message = match result {
-            Ok(1) => "Tiempo del cronómetro actualizado.".into(),
-            Ok(_) => "No se pudo reducir más: el tiempo restante mínimo es 1 minuto.".into(),
-            Err(e) => format!("No se pudo actualizar el cronómetro: {e}"),
-        };
-    }
-    fn delete_timer(&mut self, id: i64) {
-        self.message = match self.db.execute("DELETE FROM timers WHERE id=?1", [id]) {
-            Ok(_) => "Cronómetro eliminado.".into(),
-            Err(e) => format!("No se pudo eliminar: {e}"),
-        };
-    }
-    /// Picks one best applicable promotion. For each complete bundle, the cheapest stations are free.
-    fn reservation_quote(
-        &self,
-        selected: &BTreeSet<usize>,
-        hour: i32,
-    ) -> (Vec<(&'static str, i64, i64)>, String, i64) {
-        let base = selected
-            .iter()
-            .map(|index| {
-                (
-                    RESOURCES[*index].0,
-                    self.price_for_kind(RESOURCES[*index].1),
-                    0_i64,
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut best_name = String::new();
-        let mut best_discount = 0_i64;
-        let mut best_alloc = vec![0_i64; base.len()];
-        for promo in self.promotions().into_iter().filter(|p| {
-            p.start_hour <= hour && hour <= p.end_hour && p.buy_qty > p.pay_qty && p.buy_qty > 0
-        }) {
-            let mut eligible = base
-                .iter()
-                .enumerate()
-                .filter(|(_, (resource, _, _))| {
-                    selected.iter().any(|i| RESOURCES[*i].0 == *resource)
-                        && (promo.resource_kind == "all"
-                            || selected.iter().any(|i| {
-                                RESOURCES[*i].0 == *resource
-                                    && RESOURCES[*i].1 == promo.resource_kind
-                            }))
-                })
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>();
-            if promo.resource_kind != "all" {
-                eligible.retain(|i| {
-                    selected.iter().any(|index| {
-                        RESOURCES[*index].0 == base[*i].0
-                            && RESOURCES[*index].1 == promo.resource_kind
-                    })
-                });
-            }
-            eligible.sort_by_key(|i| (base[*i].1, base[*i].0));
-            let free_count = eligible.len() / promo.buy_qty * (promo.buy_qty - promo.pay_qty);
-            let mut alloc = vec![0_i64; base.len()];
-            for index in eligible.into_iter().take(free_count) {
-                alloc[index] = base[index].1;
-            }
-            let discount = alloc
-                .iter()
-                .fold(0_i64, |sum, amount| sum.saturating_add(*amount));
-            if discount > best_discount {
-                best_discount = discount;
-                best_alloc = alloc;
-                best_name = promo.name;
-            }
-        }
-        let net = base
-            .into_iter()
-            .enumerate()
-            .map(|(i, (name, price, _))| (name, price - best_alloc[i], best_alloc[i]))
-            .collect();
-        (net, best_name, best_discount)
-    }
     fn reservations(&self, day: &str) -> Vec<Reservation> {
-        let mut stmt = match self.db.prepare("SELECT id,service_date,resource,customer,start_hour,duration,games,total_cents,status,COALESCE(group_id,0) FROM reservations WHERE service_date=?1 ORDER BY start_hour,resource") { Ok(s) => s, Err(_) => return vec![] };
+        let mut stmt = match self.db.prepare("SELECT id,service_date,resource,customer,start_hour,duration,games,total_cents,status FROM reservations WHERE service_date=?1 ORDER BY start_hour,resource") { Ok(s) => s, Err(_) => return vec![] };
         stmt.query_map([day], |r| {
             Ok(Reservation {
                 id: r.get(0)?,
@@ -640,7 +302,6 @@ impl VrBoxApp {
                 games: r.get(6)?,
                 total: r.get(7)?,
                 status: r.get(8)?,
-                group_id: r.get(9)?,
             })
         })
         .map(|it| it.filter_map(Result::ok).collect())
@@ -681,166 +342,38 @@ impl VrBoxApp {
         .unwrap_or_default()
     }
     fn create_reservation(&mut self) {
-        let (stations, promo_name, discount) =
-            self.reservation_quote(&self.selected_resources, self.start_hour);
-        let day = self.day.clone();
-        let customer = self.customer.clone();
-        let station_count = stations.len();
-        let editing_id = self.editing_group_id;
-        let editing_single_id = self.editing_reservation_id;
-        let result = if editing_id > 0 {
-            reservations::update_group(
-                &mut self.db,
-                reservations::UpdateReservationGroup {
-                    group_id: editing_id,
-                    day: &day,
-                    customer: &customer,
-                    start_hour: self.start_hour,
-                    promo_name: &promo_name,
-                    stations: &stations,
-                },
-            )
-            .map(|()| editing_id)
-        } else if editing_single_id > 0 {
-            if stations.len() != 1 {
-                Err("Esta reserva histórica es individual: elegí exactamente una estación.".into())
-            } else {
-                let (station, price, line_discount) = stations[0];
-                reservations::update_single(
-                    &mut self.db,
-                    reservations::UpdateSingleReservation {
-                        reservation_id: editing_single_id,
-                        day: &day,
-                        customer: &customer,
-                        start_hour: self.start_hour,
-                        station,
-                        total_cents: price,
-                        discount_cents: line_discount,
-                    },
-                )
-                .map(|()| editing_single_id)
-            }
-        } else {
-            reservations::create_group(
-                &mut self.db,
-                reservations::NewReservationGroup {
-                    day: &day,
-                    customer: &customer,
-                    start_hour: self.start_hour,
-                    promo_name: &promo_name,
-                    stations: &stations,
-                },
-            )
-        };
-        match result {
-            Ok(group_id) => {
-                self.customer.clear();
-                self.selected_resources.clear();
-                self.editing_group_id = 0;
-                self.editing_reservation_id = 0;
-                let total = stations
-                    .iter()
-                    .fold(0_i64, |sum, (_, amount, _)| sum.saturating_add(*amount));
-                self.message = if editing_id > 0 || editing_single_id > 0 {
-                    format!("Reserva #{group_id} modificada · {}.", money(total))
-                } else if promo_name.is_empty() {
-                    format!(
-                        "Reserva grupal #{group_id}: {station_count} estación(es) · {}.",
-                        money(total)
-                    )
-                } else {
-                    format!(
-                        "Reserva grupal #{group_id}: {promo_name} · descuento {} · total {}.",
-                        money(discount),
-                        money(total)
-                    )
-                };
-            }
-            Err(error) => self.message = error,
-        }
-    }
-    fn begin_edit_group(&mut self, group_id: i64, stations: &[Reservation]) {
-        if stations.is_empty() || stations.iter().any(|r| r.status != "reservada") {
-            self.message = "Solo se pueden modificar grupos aún no iniciados.".into();
+        if self.customer.trim().is_empty() {
+            self.message = "Ingresá el nombre del cliente.".into();
             return;
         }
-        self.editing_group_id = group_id;
-        self.editing_reservation_id = if group_id > 0 { 0 } else { stations[0].id };
-        self.day = stations[0].day.clone();
-        self.customer = stations[0].customer.clone();
-        self.start_hour = stations[0].start as i32;
-        self.selected_resources = stations
-            .iter()
-            .filter_map(|r| RESOURCES.iter().position(|(name, _)| *name == r.resource))
-            .collect();
-        self.page = Page::Reservations;
-        let id = if group_id > 0 {
-            group_id
-        } else {
-            stations[0].id
-        };
-        self.message =
-            format!("Editando la reserva #{id}. Revisá el nuevo total antes de guardar.");
-    }
-    fn paid_for(&self, group_id: i64, reservation_id: i64) -> i64 {
-        let query = if group_id > 0 {
-            self.db.query_row("SELECT COALESCE(SUM(CASE WHEN kind='devolucion' THEN -amount_cents ELSE amount_cents END),0) FROM reservation_payments WHERE group_id=?1", [group_id], |r| r.get(0))
-        } else {
-            self.db.query_row("SELECT COALESCE(SUM(CASE WHEN kind='devolucion' THEN -amount_cents ELSE amount_cents END),0) FROM reservation_payments WHERE reservation_id=?1", [reservation_id], |r| r.get(0))
-        };
-        query.unwrap_or(0)
-    }
-    fn record_reservation_payment(
-        &mut self,
-        group_id: i64,
-        reservation_id: i64,
-        action: reservations::PaymentAction,
-        requested: i64,
-    ) {
-        let method = if self.reservation_payment_transfer {
-            "transferencia"
-        } else {
-            "efectivo"
-        };
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        match reservations::record_payment(
-            &mut self.db,
-            (group_id > 0).then_some(group_id),
-            (reservation_id > 0).then_some(reservation_id),
-            action,
-            requested,
-            method,
-            &today,
-        ) {
-            Ok(amount) => {
-                self.message = format!("Pago registrado · {} · {}.", method, money(amount))
-            }
-            Err(e) => self.message = e,
+        if NaiveDate::parse_from_str(&self.day, "%Y-%m-%d").is_err() {
+            self.message = "La fecha operativa debe tener formato AAAA-MM-DD.".into();
+            return;
         }
-    }
-    fn cancel_reservation(&mut self, group_id: i64, reservation_id: i64) {
-        let method = if self.reservation_payment_transfer {
-            "transferencia"
-        } else {
-            "efectivo"
-        };
-        let today = Local::now().format("%Y-%m-%d").to_string();
-        match reservations::cancel_group(
-            &mut self.db,
-            (group_id > 0).then_some(group_id),
-            (reservation_id > 0).then_some(reservation_id),
-            method,
-            &today,
-        ) {
-            Ok(refund) if refund > 0 => {
-                self.message = format!(
-                    "Reserva cancelada · devolución registrada: {}.",
-                    money(refund)
-                )
-            }
-            Ok(_) => self.message = "Reserva cancelada.".into(),
-            Err(e) => self.message = e,
+        if !(16..=23).contains(&self.start_hour) {
+            self.message = "El horario debe quedar dentro de la jornada de 16:00 a 00:00.".into();
+            return;
         }
+        let (resource, kind) = RESOURCES[self.resource_idx];
+        let collision: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM reservations WHERE service_date=?1 AND resource=?2 AND status!='cancelada' AND start_hour < ?3 AND start_hour + duration > ?4",
+            params![self.day, resource, self.start_hour + 1, self.start_hour],
+            |row| row.get(0),
+        ).unwrap_or(1);
+        if collision > 0 {
+            self.message = "Ese puesto ya está ocupado en parte de ese horario.".into();
+            return;
+        }
+        let games = String::new();
+        let total = self.price_for_kind(kind);
+        let result=self.db.execute("INSERT INTO reservations(service_date,resource,customer,start_hour,duration,games,total_cents,discount_cents,note) VALUES(?1,?2,?3,?4,1,?5,?6,0,'')",params![self.day,resource,self.customer.trim(),self.start_hour,games,total]);
+        self.message = match result {
+            Ok(_) => {
+                self.customer.clear();
+                "Reserva guardada.".into()
+            }
+            Err(e) => format!("No se pudo reservar: {e}"),
+        };
     }
     fn add_product(&mut self) {
         if self.product_name.trim().is_empty() {
@@ -880,10 +413,7 @@ impl VrBoxApp {
             "efectivo"
         };
         let products = self.products();
-        let tx = match self
-            .db
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        {
+        let tx = match self.db.transaction() {
             Ok(tx) => tx,
             Err(e) => {
                 self.message = format!("No se pudo abrir la venta: {e}");
@@ -900,18 +430,9 @@ impl VrBoxApp {
                 return;
             }
             let total = p.price * *quantity;
-            let sold = tx.execute(
-                "UPDATE products SET stock=stock-?1 WHERE id=?2 AND stock>=?1",
-                params![quantity, p.id],
-            );
-            if !matches!(sold, Ok(1)) {
-                self.message = format!(
-                    "Stock insuficiente para {}. No se aplicó el carrito.",
-                    p.name
-                );
-                return;
-            }
-            if let Err(e) = tx.execute("INSERT INTO sales(category,item,quantity,unit_cents,total_cents,payment,service_date) VALUES('bebida',?1,?2,?3,?4,?5,?6)", params![p.name, quantity, p.price, total, payment, self.day]) {
+            let result = tx.execute("INSERT INTO sales(category,item,quantity,unit_cents,total_cents,payment,service_date) VALUES('bebida',?1,?2,?3,?4,?5,?6)", params![p.name, quantity, p.price, total, payment, self.day])
+                .and_then(|_| tx.execute("UPDATE products SET stock=stock-?1 WHERE id=?2 AND stock>=?1", params![quantity,p.id]));
+            if let Err(e) = result {
                 self.message = format!("No se completó la venta: {e}");
                 return;
             }
@@ -1054,10 +575,7 @@ impl VrBoxApp {
                 return;
             }
         };
-        let tx = match self
-            .db
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        {
+        let tx = match self.db.transaction() {
             Ok(tx) => tx,
             Err(e) => {
                 self.message = format!("No se pudo iniciar la importación: {e}");
@@ -1087,28 +605,9 @@ impl VrBoxApp {
             ("price_play", &self.price_play),
             ("price_vr", &self.price_vr),
         ] {
-            let _=self.db.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value.parse::<i64>().unwrap_or(0).clamp(0,1_000_000_000).to_string()]);
+            let _=self.db.execute("INSERT INTO settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",params![key,value.parse::<i64>().unwrap_or(0).max(0).to_string()]);
         }
         self.message = "Tarifas guardadas. Se aplican a nuevas reservas.".into();
-    }
-    fn add_promotion(&mut self) {
-        let buy = self.promo_buy.parse::<i64>().unwrap_or(0);
-        let pay = self.promo_pay.parse::<i64>().unwrap_or(0);
-        if self.promo_name.trim().is_empty() || buy < 2 || pay < 1 || pay >= buy {
-            self.message =
-                "Completá el nombre y una mecánica válida (por ejemplo, 2 por 1).".into();
-            return;
-        }
-        if !(16..=23).contains(&self.promo_start)
-            || !(self.promo_start..=23).contains(&self.promo_end)
-        {
-            self.message = "El horario de la promoción debe estar entre 16:00 y 23:00.".into();
-            return;
-        }
-        match self.db.execute("INSERT INTO promotions(name,buy_qty,pay_qty,start_hour,end_hour,resource_kind) VALUES(?1,?2,?3,?4,?5,?6)", params![self.promo_name.trim(), buy, pay, self.promo_start, self.promo_end, self.promo_kind]) {
-            Ok(_) => { self.message = format!("Promoción '{}' guardada.", self.promo_name.trim()); self.promo_name.clear(); }
-            Err(e) => self.message = format!("No se pudo guardar la promoción: {e}"),
-        }
     }
     fn add_event(&mut self) {
         if self.event_title.trim().is_empty() {
@@ -1133,18 +632,15 @@ impl VrBoxApp {
     }
     fn totals(&self) -> (i64, i64, i64, i64) {
         let row=self.db.query_row("SELECT COALESCE(SUM(CASE WHEN payment='efectivo' THEN total_cents ELSE 0 END),0), COALESCE(SUM(CASE WHEN payment='transferencia' THEN total_cents ELSE 0 END),0), COALESCE(SUM(CASE WHEN category='bebida' THEN total_cents ELSE 0 END),0), COUNT(*) FROM sales WHERE service_date=?1",[self.day.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap_or((0,0,0,0));
-        let reserved_groups: i64 = self.db.query_row(
-            "SELECT COALESCE(SUM(MAX(0,g.total_cents-COALESCE((SELECT SUM(CASE WHEN p.kind='devolucion' THEN -p.amount_cents ELSE p.amount_cents END) FROM reservation_payments p WHERE p.group_id=g.id),0))),0) FROM reservation_groups g WHERE g.service_date=?1 AND EXISTS(SELECT 1 FROM reservations r WHERE r.group_id=g.id AND r.status='reservada')",
-            [self.day.as_str()], |r| r.get(0)
-        ).unwrap_or(0);
-        let reserved_single: i64 = self.db.query_row(
-            "SELECT COALESCE(SUM(MAX(0,r.total_cents-COALESCE((SELECT SUM(CASE WHEN p.kind='devolucion' THEN -p.amount_cents ELSE p.amount_cents END) FROM reservation_payments p WHERE p.reservation_id=r.id),0))),0) FROM reservations r WHERE r.group_id IS NULL AND r.service_date=?1 AND r.status='reservada'",
-            [self.day.as_str()], |r| r.get(0)
-        ).unwrap_or(0);
-        let reserved = reserved_groups.saturating_add(reserved_single);
+        let reserved=self.db.query_row("SELECT COALESCE(SUM(total_cents),0) FROM reservations WHERE service_date=?1 AND status='reservada'",[self.day.as_str()],|r|r.get(0)).unwrap_or(0);
         (row.0, row.1, row.2, reserved)
     }
     fn register_session(&mut self, r: &Reservation) {
+        let payment = if self.pay_transfer {
+            "transferencia"
+        } else {
+            "efectivo"
+        };
         let game = self.session_game.clone();
         let tx = match self.db.transaction() {
             Ok(tx) => tx,
@@ -1153,17 +649,15 @@ impl VrBoxApp {
                 return;
             }
         };
-        let changed = tx.execute("UPDATE reservations SET status='completada',games=?1 WHERE id=?2 AND status='reservada'",params![game,r.id]);
-        if !matches!(changed, Ok(1)) {
-            self.message = "Esta estación ya se cobró o cambió de estado. Actualizá la agenda antes de continuar.".into();
+        let result = tx.execute("INSERT INTO sales(category,item,quantity,unit_cents,total_cents,payment,service_date) VALUES('sesion',?1,1,?2,?2,?3,?4)",params![format!("{} — {}",r.resource,game),r.total,payment,self.day])
+            .and_then(|_| tx.execute("UPDATE reservations SET status='completada',games=?1 WHERE id=?2 AND status='reservada'",params![game,r.id]));
+        if result.is_err() {
+            self.message = "No se pudo completar el cobro de la sesión.".into();
             return;
         }
         match tx.commit() {
-            Ok(()) => {
-                self.message =
-                    format!("Sesión completada · {game}. Consultá el estado del pago en Reservas.");
-            }
-            Err(e) => self.message = format!("No se pudo completar la sesión: {e}"),
+            Ok(()) => self.message = format!("Sesión cobrada · {} · {}.", game, money(r.total)),
+            Err(e) => self.message = format!("No se pudo completar el cobro: {e}"),
         }
     }
     fn close_and_export(&mut self) {
@@ -1273,58 +767,6 @@ impl VrBoxApp {
         }
         {
             let sheet = workbook.add_worksheet();
-            sheet
-                .set_name("Pagos reservas")
-                .map_err(|e| e.to_string())?;
-            for (col, title) in [
-                "Fecha y hora",
-                "Cliente",
-                "Tipo",
-                "Monto centavos",
-                "Medio",
-                "Reserva",
-            ]
-            .iter()
-            .enumerate()
-            {
-                sheet
-                    .write_string(0, col as u16, *title)
-                    .map_err(|e| e.to_string())?;
-            }
-            let mut stmt = self.db.prepare(
-                "SELECT p.paid_at,COALESCE(g.customer,r.customer,''),p.kind,p.amount_cents,p.payment,COALESCE('Grupo #'||p.group_id,'Reserva #'||p.reservation_id) FROM reservation_payments p LEFT JOIN reservation_groups g ON g.id=p.group_id LEFT JOIN reservations r ON r.id=p.reservation_id WHERE p.service_date=?1 ORDER BY p.paid_at,p.id"
-            ).map_err(|e| e.to_string())?;
-            let rows = stmt
-                .query_map([self.day.as_str()], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, i64>(3)?,
-                        r.get::<_, String>(4)?,
-                        r.get::<_, String>(5)?,
-                    ))
-                })
-                .map_err(|e| e.to_string())?;
-            for (i, row) in rows.enumerate() {
-                let (at, customer, kind, amount, method, target) =
-                    row.map_err(|e| e.to_string())?;
-                let row = i as u32 + 1;
-                for (col, value) in [(0, at), (1, customer), (2, kind), (4, method), (5, target)] {
-                    sheet
-                        .write_string(row, col, value)
-                        .map_err(|e| e.to_string())?;
-                }
-                sheet
-                    .write_number(row, 3, amount as f64)
-                    .map_err(|e| e.to_string())?;
-            }
-            for col in 0..6 {
-                sheet.set_column_width(col, 24).map_err(|e| e.to_string())?;
-            }
-        }
-        {
-            let sheet = workbook.add_worksheet();
             sheet.set_name("Agenda").map_err(|e| e.to_string())?;
             for (c, h) in [
                 "Fecha",
@@ -1335,7 +777,6 @@ impl VrBoxApp {
                 "Juegos",
                 "Total centavos",
                 "Estado",
-                "Grupo reserva",
             ]
             .iter()
             .enumerate()
@@ -1352,7 +793,6 @@ impl VrBoxApp {
                     (2, r.customer.clone()),
                     (5, r.games.clone()),
                     (7, r.status.clone()),
-                    (8, r.group_id.to_string()),
                 ] {
                     sheet
                         .write_string(row, col, val)
@@ -1364,7 +804,7 @@ impl VrBoxApp {
                         .map_err(|e| e.to_string())?;
                 }
             }
-            for col in 0..9 {
+            for col in 0..8 {
                 sheet.set_column_width(col, 21).map_err(|e| e.to_string())?;
             }
         }
@@ -1373,8 +813,9 @@ impl VrBoxApp {
             sheet.set_name("Por juego").map_err(|e| e.to_string())?;
             for (col, title) in [
                 "Juego",
-                "Estaciones completadas",
-                "Total por juego centavos",
+                "Efectivo centavos",
+                "Transferencia centavos",
+                "Total centavos",
             ]
             .iter()
             .enumerate()
@@ -1384,15 +825,22 @@ impl VrBoxApp {
                     .map_err(|e| e.to_string())?;
             }
             let mut totals: BTreeMap<String, (i64, i64)> = BTreeMap::new();
-            let mut stmt = self.db.prepare("SELECT games,total_cents FROM reservations WHERE service_date=?1 AND status='completada' ORDER BY id").map_err(|e| e.to_string())?;
+            let mut stmt = self.db.prepare("SELECT item,total_cents,payment FROM sales WHERE service_date=?1 AND category='sesion'").map_err(|e| e.to_string())?;
             let rows = stmt
                 .query_map([self.day.as_str()], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
                 })
                 .map_err(|e| e.to_string())?;
             for row in rows {
-                let (games_text, total) = row.map_err(|e| e.to_string())?;
-                let games = games_text
+                let (item, total, payment) = row.map_err(|e| e.to_string())?;
+                let games = item
+                    .split(" — ")
+                    .nth(1)
+                    .unwrap_or("")
                     .split(", ")
                     .filter(|g| !g.is_empty())
                     .collect::<Vec<_>>();
@@ -1404,27 +852,33 @@ impl VrBoxApp {
                 for (index, game) in games.iter().enumerate() {
                     let attributed = each + i64::from((index as i64) < remainder);
                     let entry = totals.entry((*game).to_string()).or_default();
-                    entry.0 += 1;
-                    entry.1 += attributed;
+                    if payment == "efectivo" {
+                        entry.0 += attributed;
+                    } else {
+                        entry.1 += attributed;
+                    }
                 }
             }
             sheet
                 .write_string(
                     1,
                     0,
-                    "Uso completado por juego. Los cobros por medio están en la hoja Ventas.",
+                    "Regla: sesiones multijuego distribuidas en partes iguales",
                 )
                 .map_err(|e| e.to_string())?;
-            for (index, (game, (sessions, total))) in totals.iter().enumerate() {
+            for (index, (game, (cash, transfer))) in totals.iter().enumerate() {
                 let row = index as u32 + 2;
                 sheet
                     .write_string(row, 0, game)
                     .map_err(|e| e.to_string())?;
                 sheet
-                    .write_number(row, 1, *sessions as f64)
+                    .write_number(row, 1, *cash as f64)
                     .map_err(|e| e.to_string())?;
                 sheet
-                    .write_number(row, 2, *total as f64)
+                    .write_number(row, 2, *transfer as f64)
+                    .map_err(|e| e.to_string())?;
+                sheet
+                    .write_number(row, 3, (cash + transfer) as f64)
                     .map_err(|e| e.to_string())?;
             }
             for col in 0..4 {
@@ -1440,7 +894,7 @@ impl VrBoxApp {
                 .write_string(0, 0, "Franja")
                 .map_err(|e| e.to_string())?;
             sheet
-                .write_string(0, 1, "Horas de estación cobradas")
+                .write_string(0, 1, "Horas reservadas cobradas")
                 .map_err(|e| e.to_string())?;
             let mut occupancy = [0_i64; 8];
             for r in self
@@ -1553,14 +1007,6 @@ impl VrBoxApp {
 impl eframe::App for VrBoxApp {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        ctx.request_repaint_after(Duration::from_secs(1));
-        let now = Local::now().timestamp();
-        let all_timers = self.game_timers();
-        let expired_timers = all_timers
-            .iter()
-            .filter(|timer| timer.ends_at <= now)
-            .cloned()
-            .collect::<Vec<_>>();
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(10, 15, 27);
         visuals.window_fill = Color32::from_rgb(17, 25, 41);
@@ -1603,26 +1049,6 @@ impl eframe::App for VrBoxApp {
                                 .color(Color32::from_rgb(107, 190, 203)),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(timer) = expired_timers.first() {
-                                if ui
-                                    .button(
-                                        RichText::new(format!(
-                                            "TIEMPO FINALIZADO · {}",
-                                            timer.resource
-                                        ))
-                                        .color(Color32::from_rgb(255, 151, 142)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.page = Page::Timers;
-                                }
-                            } else if !all_timers.is_empty() {
-                                ui.label(
-                                    RichText::new("CRONÓMETROS EN CURSO")
-                                        .small()
-                                        .color(Color32::from_rgb(91, 203, 196)),
-                                );
-                            }
                             ui.label(
                                 RichText::new("FECHA OPERATIVA")
                                     .small()
@@ -1630,7 +1056,7 @@ impl eframe::App for VrBoxApp {
                             );
                             ui.add_sized([130.0, 30.0], egui::TextEdit::singleline(&mut self.day));
                             ui.label(
-                                RichText::new("SISTEMA LOCAL")
+                                RichText::new("●  SISTEMA LOCAL")
                                     .color(Color32::from_rgb(107, 206, 166))
                                     .small(),
                             );
@@ -1649,15 +1075,13 @@ impl eframe::App for VrBoxApp {
                 );
                 ui.add_space(10.0);
                 for (page, icon, label) in [
-                    (Page::Agenda, "AG", "Agenda"),
-                    (Page::Reservations, "RS", "Reservas"),
-                    (Page::Sales, "VT", "Punto de venta"),
-                    (Page::Products, "ST", "Bebidas y stock"),
-                    (Page::Prices, "$", "Tarifas"),
-                    (Page::Promotions, "OF", "Promociones"),
-                    (Page::Timers, "CR", "Cronómetros"),
-                    (Page::Closing, "CJ", "Cierre de caja"),
-                    (Page::Events, "EV", "Eventos y alertas"),
+                    (Page::Agenda, "▦", "Agenda"),
+                    (Page::Reservations, "＋", "Reservas"),
+                    (Page::Sales, "▣", "Punto de venta"),
+                    (Page::Products, "◈", "Bebidas y stock"),
+                    (Page::Prices, "◇", "Tarifas"),
+                    (Page::Closing, "◫", "Cierre de caja"),
+                    (Page::Events, "✦", "Eventos y alertas"),
                 ] {
                     let selected = self.page == page;
                     let transition =
@@ -1676,13 +1100,7 @@ impl eframe::App for VrBoxApp {
                         .show(ui, |ui| {
                             ui.set_min_width(164.0);
                             ui.horizontal(|ui| {
-                                ui.add_sized(
-                                    [28.0, 24.0],
-                                    egui::Label::new(
-                                        RichText::new(icon).color(text_color).monospace().strong(),
-                                    )
-                                    .selectable(false),
-                                );
+                                ui.label(RichText::new(icon).color(text_color).size(18.0));
                                 ui.label(RichText::new(label).color(text_color).strong());
                             });
                         })
@@ -1722,8 +1140,6 @@ impl eframe::App for VrBoxApp {
                                 Page::Sales => self.ui_sales(ui),
                                 Page::Products => self.ui_products(ui),
                                 Page::Prices => self.ui_prices(ui),
-                                Page::Promotions => self.ui_promotions(ui),
-                                Page::Timers => self.ui_timers(ui),
                                 Page::Closing => self.ui_closing(ui),
                                 Page::Events => self.ui_events(ui),
                             }
@@ -1735,45 +1151,6 @@ impl eframe::App for VrBoxApp {
                         });
                 });
         });
-        if let Some((group_id, reservation_id)) = self.pending_cancel {
-            let paid = self.paid_for(group_id, reservation_id);
-            let method = if self.reservation_payment_transfer {
-                "transferencia"
-            } else {
-                "efectivo"
-            };
-            let mut confirm = false;
-            let mut dismiss = false;
-            egui::Window::new("Confirmar cancelación")
-                .collapsible(false)
-                .resizable(false)
-                .show(&ctx, |ui| {
-                    ui.label("La cancelación quedará registrada en el historial.");
-                    if paid > 0 {
-                        ui.label(format!(
-                            "Se devolverán {} por {} y se registrará la salida en caja.",
-                            money(paid),
-                            method
-                        ));
-                    } else {
-                        ui.label("No hay pagos asociados a esta reserva.");
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button("Volver").clicked() {
-                            dismiss = true;
-                        }
-                        if ui.button("Confirmar cancelación").clicked() {
-                            confirm = true;
-                        }
-                    });
-                });
-            if confirm {
-                self.pending_cancel = None;
-                self.cancel_reservation(group_id, reservation_id);
-            } else if dismiss {
-                self.pending_cancel = None;
-            }
-        }
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
@@ -1822,7 +1199,7 @@ impl VrBoxApp {
                             [106.0, 42.0],
                             egui::Label::new(
                                 RichText::new(if idx >= 6 {
-                                    name.to_string()
+                                    format!("◆ {name}")
                                 } else {
                                     (*name).to_string()
                                 })
@@ -1916,7 +1293,7 @@ impl VrBoxApp {
                 });
         });
         ui.add_space(8.0);
-        ui.label(RichText::new("Dos simuladores Oro  ·  seis simuladores Plata  ·  cada reserva ocupa un bloque de 60 minutos.").small().color(Color32::from_rgb(132, 153, 175)));
+        ui.label(RichText::new("◆ Dos simuladores Oro  ·  seis simuladores Plata  ·  cada reserva ocupa un bloque de 60 minutos.").small().color(Color32::from_rgb(132, 153, 175)));
     }
     fn ui_reservations(&mut self, ui: &mut egui::Ui) {
         ui.label(
@@ -1924,32 +1301,9 @@ impl VrBoxApp {
                 .small()
                 .color(Color32::from_rgb(91, 186, 200)),
         );
-        ui.columns(2, |columns| {
-            columns[0].vertical(|ui| {
-        ui.heading(
-            RichText::new(
-                if self.editing_group_id > 0 || self.editing_reservation_id > 0 {
-                    format!(
-                        "Modificar reserva #{}",
-                        if self.editing_group_id > 0 {
-                            self.editing_group_id
-                        } else {
-                            self.editing_reservation_id
-                        }
-                    )
-                } else {
-                    "Nueva reserva grupal".into()
-                },
-            )
-            .size(27.0)
-            .strong(),
-        );
+        ui.heading(RichText::new("Nueva sesión").size(27.0).strong());
         ui.label(
-            RichText::new(if self.editing_reservation_id > 0 {
-                "Reserva individual heredada: elegí una estación, una hora y revisá el nuevo total."
-            } else {
-                "Sumá todas las estaciones que necesita el cliente. Se reservarán juntas en el mismo horario."
-            })
+            RichText::new("Elegí un equipo y una hora. Cada turno dura una hora.")
                 .color(Color32::from_rgb(151, 171, 192)),
         );
         ui.add_space(10.0);
@@ -1970,50 +1324,15 @@ impl VrBoxApp {
                     .color(Color32::from_rgb(91, 186, 200))
                     .size(18.0),
             );
-            ui.heading("Elegí las estaciones");
-            ui.label(
-                RichText::new(format!("{} seleccionadas", self.selected_resources.len()))
-                    .color(Color32::from_rgb(230, 190, 96)),
-            );
+            ui.heading("Elegí tu espacio");
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new("SELECCIÓN RÁPIDA")
-                    .small()
-                    .color(Color32::from_rgb(111, 141, 164)),
-            );
-            for (label, first, last) in [
-                ("Plata ×6", 0, 6),
-                ("Oro ×2", 6, 8),
-                ("PS5 ×2", 8, 10),
-                ("VR ×2", 10, 12),
-            ] {
-                let all_selected =
-                    (first..last).all(|index| self.selected_resources.contains(&index));
-                if ui.selectable_label(all_selected, label).clicked() {
-                    if all_selected {
-                        for index in first..last {
-                            self.selected_resources.remove(&index);
-                        }
-                    } else {
-                        for index in first..last {
-                            self.selected_resources.insert(index);
-                        }
-                    }
-                }
-            }
-            if ui.small_button("Limpiar").clicked() {
-                self.selected_resources.clear();
-            }
-        });
-        let reservations = self.reservations(&self.day);
         egui::Grid::new("resource_buttons")
             .num_columns(4)
             .spacing(Vec2::new(10.0, 10.0))
             .show(ui, |ui| {
                 for (i, (name, _)) in RESOURCES.iter().enumerate() {
-                    let selected = self.selected_resources.contains(&i);
-                    let gold = i == 6 || i == 7;
+                    let selected = self.resource_idx == i;
+                    let gold = i >= 6;
                     let tint = if gold {
                         Color32::from_rgb(230, 188, 94)
                     } else {
@@ -2028,33 +1347,7 @@ impl VrBoxApp {
                     } else {
                         Color32::from_rgb(20, 31, 48)
                     };
-                    let available = !reservations.iter().any(|r| {
-                        r.resource == *name
-                            && r.start == self.start_hour as i64
-                            && r.status != "cancelada"
-                            && (self.editing_group_id <= 0 || r.group_id != self.editing_group_id)
-                            && (self.editing_reservation_id <= 0
-                                || r.id != self.editing_reservation_id)
-                    });
-                    let tier = if gold {
-                        "ORO"
-                    } else if i < 6 {
-                        "PLATA"
-                    } else if i < 10 {
-                        "PS5"
-                    } else {
-                        "VR"
-                    };
-                    let state = if selected && available {
-                        "AGREGADA · LIBRE".to_string()
-                    } else if selected {
-                        format!("AGREGADA · ELEGÍ OTRA HORA")
-                    } else if available {
-                        "DISPONIBLE".to_string()
-                    } else {
-                        format!("OCUPADA A LAS {:02}:00", self.start_hour)
-                    };
-                    let label = format!("{}\n{}\n{}", tier, name, state);
+                    let label = format!("{}\n{}", if gold { "◆ ORO" } else { "◇ PLATA" }, name);
                     let response = ui.add_sized(
                         [150.0, 64.0],
                         egui::Button::new(
@@ -2073,13 +1366,16 @@ impl VrBoxApp {
                         )),
                     );
                     if response.clicked() {
-                        if self.editing_reservation_id > 0 {
-                            self.selected_resources.clear();
-                            self.selected_resources.insert(i);
-                        } else if selected {
-                            self.selected_resources.remove(&i);
-                        } else {
-                            self.selected_resources.insert(i);
+                        self.resource_idx = i;
+                        let reservations = self.reservations(&self.day);
+                        let blocked = |hour| {
+                            reservations.iter().any(|r| {
+                                r.resource == *name && r.start == hour && r.status != "cancelada"
+                            })
+                        };
+                        if blocked(self.start_hour as i64) {
+                            self.start_hour =
+                                (16..24).find(|hour| !blocked(*hour)).unwrap_or(16) as i32;
                         }
                     }
                     if (i + 1) % 4 == 0 {
@@ -2098,15 +1394,10 @@ impl VrBoxApp {
         });
         ui.horizontal_wrapped(|ui| {
             for hour in 16..24 {
-                let occupied = self.selected_resources.iter().any(|index| {
-                    reservations.iter().any(|r| {
-                        r.resource == RESOURCES[*index].0
-                            && r.start == hour
-                            && r.status != "cancelada"
-                            && (self.editing_group_id <= 0 || r.group_id != self.editing_group_id)
-                            && (self.editing_reservation_id <= 0
-                                || r.id != self.editing_reservation_id)
-                    })
+                let occupied = self.reservations(&self.day).iter().any(|r| {
+                    r.resource == RESOURCES[self.resource_idx].0
+                        && r.start == hour
+                        && r.status != "cancelada"
                 });
                 let selected = self.start_hour == hour as i32;
                 let color = if occupied {
@@ -2131,17 +1422,7 @@ impl VrBoxApp {
                 }
             }
         });
-        let (quoted_stations, promo_name, discount) =
-            self.reservation_quote(&self.selected_resources, self.start_hour);
-        let price = quoted_stations
-            .iter()
-            .fold(0_i64, |sum, (_, amount, _)| sum.saturating_add(*amount));
-        let station_names = self
-            .selected_resources
-            .iter()
-            .map(|index| RESOURCES[*index].0)
-            .collect::<Vec<_>>()
-            .join(" · ");
+        let price = self.price_for_kind(RESOURCES[self.resource_idx].1);
         ui.add_space(14.0);
         egui::Frame::new()
             .fill(Color32::from_rgb(19, 32, 49))
@@ -2152,8 +1433,8 @@ impl VrBoxApp {
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new(format!(
-                                "{} estación(es)  ·  {:02}:00–{:02}:00",
-                                self.selected_resources.len(),
+                                "{}  ·  {:02}:00–{:02}:00",
+                                RESOURCES[self.resource_idx].0,
                                 self.start_hour,
                                 self.start_hour + 1
                             ))
@@ -2161,26 +1442,9 @@ impl VrBoxApp {
                             .size(16.0),
                         );
                         ui.label(
-                            RichText::new(if station_names.is_empty() {
-                                "Seleccioná las estaciones que querés reservar".to_string()
-                            } else {
-                                station_names.clone()
-                            })
-                            .small()
-                            .color(Color32::from_rgb(152, 185, 199)),
-                        );
-                        ui.label(
-                            RichText::new(if promo_name.is_empty() {
-                                "Bloque fijo de 60 minutos · precio por estación".to_string()
-                            } else {
-                                format!("Oferta {} · ahorrás {}", promo_name, money(discount))
-                            })
-                            .small()
-                            .color(if promo_name.is_empty() {
-                                Color32::GRAY
-                            } else {
-                                Color32::from_rgb(124, 214, 177)
-                            }),
+                            RichText::new("1 hora · precio según tarifa vigente")
+                                .small()
+                                .color(Color32::GRAY),
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2195,200 +1459,34 @@ impl VrBoxApp {
         ui.add_space(10.0);
         if ui
             .add_enabled(
-                !self.customer.trim().is_empty()
-                    && !self.selected_resources.is_empty()
-                    && !self.selected_resources.iter().any(|index| {
-                        reservations.iter().any(|r| {
-                            r.resource == RESOURCES[*index].0
-                                && r.start == self.start_hour as i64
-                                && r.status != "cancelada"
-                                && (self.editing_group_id <= 0
-                                    || r.group_id != self.editing_group_id)
-                                && (self.editing_reservation_id <= 0
-                                    || r.id != self.editing_reservation_id)
-                        })
-                    }),
-                egui::Button::new(
-                    RichText::new(
-                        if self.editing_group_id > 0 || self.editing_reservation_id > 0 {
-                            "GUARDAR CAMBIOS"
-                        } else {
-                            "CONFIRMAR RESERVA"
-                        },
-                    )
-                    .strong(),
-                )
-                .min_size(Vec2::new(260.0, 46.0))
-                .fill(Color32::from_rgb(29, 120, 137)),
+                !self.customer.trim().is_empty(),
+                egui::Button::new(RichText::new("CONFIRMAR RESERVA   →").strong())
+                    .min_size(Vec2::new(260.0, 46.0))
+                    .fill(Color32::from_rgb(29, 120, 137)),
             )
             .clicked()
         {
             self.create_reservation();
         }
-        if (self.editing_group_id > 0 || self.editing_reservation_id > 0)
-            && ui.button("Salir de la edición").clicked()
-        {
-            self.editing_group_id = 0;
-            self.editing_reservation_id = 0;
-            self.customer.clear();
-            self.selected_resources.clear();
-            self.message = "Edición descartada.".into();
-        }
-            });
-            columns[1].vertical(|ui| {
-                ui.heading(format!("Turnos de hoy · {}", self.day));
-                self.reservation_list(ui);
-            });
-        });
+        ui.separator();
+        ui.heading(format!("Turnos de hoy · {}", self.day));
+        self.reservation_list(ui);
     }
     fn reservation_list(&mut self, ui: &mut egui::Ui) {
         let rows = self.reservations(&self.day);
-        let mut groups: BTreeMap<i64, Vec<Reservation>> = BTreeMap::new();
-        for row in rows {
-            let key = if row.group_id > 0 {
-                row.group_id
-            } else {
-                -row.id
-            };
-            groups.entry(key).or_default().push(row);
-        }
-        for (_, stations) in groups {
-            let first = &stations[0];
-            let group_id = first.group_id;
-            let reservation_id = if group_id == 0 { first.id } else { 0 };
-            let total = stations
-                .iter()
-                .fold(0_i64, |sum, s| sum.saturating_add(s.total));
-            let paid = self.paid_for(group_id, reservation_id);
-            let canceled = stations.iter().all(|r| r.status == "cancelada");
-            let balance = if canceled {
-                0
-            } else {
-                total.saturating_sub(paid)
-            };
-            let editable = stations.iter().all(|r| r.status == "reservada");
-            let cancellable = stations.iter().all(|r| r.status == "reservada");
-            let payable = stations
-                .iter()
-                .all(|r| r.status == "reservada" || r.status == "completada");
-            let mut edit = false;
-            let mut cancel = false;
-            let mut payment_action = None;
-            egui::Frame::new()
-                .fill(Color32::from_rgb(18, 30, 46))
-                .corner_radius(egui::CornerRadius::same(10))
-                .inner_margin(egui::Margin::symmetric(12, 6))
-                .show(ui, |ui| {
+        egui::ScrollArea::vertical()
+            .max_height(300.0)
+            .show(ui, |ui| {
+                for r in rows {
                     ui.horizontal(|ui| {
-                                ui.strong(format!("{:02}:00", first.start));
-                                ui.strong(&first.customer);
-                                ui.label(format!("{} estación(es)", stations.len()));
-                                if first.group_id > 0 {
-                                    let promo = self
-                                        .db
-                                        .query_row(
-                                            "SELECT promo_name,discount_cents FROM reservation_groups WHERE id=?1",
-                                            [first.group_id],
-                                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
-                                        )
-                                        .unwrap_or_default();
-                                    if !promo.0.is_empty() {
-                                        ui.label(
-                                            RichText::new(format!("OFERTA: {} · ahorro {}", promo.0, money(promo.1)))
-                                                .small()
-                                                .color(Color32::from_rgb(124, 214, 177)),
-                                        );
-                                    }
-                                }
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.strong(
-                                            RichText::new(money(
-                                                stations.iter().map(|s| s.total).sum(),
-                                            ))
-                                            .color(Color32::from_rgb(230, 190, 96)),
-                                        );
-                                    },
-                                );
+                        ui.label(format!("{:02}:00–{:02}:00", r.start, r.start + r.duration));
+                        ui.label(&r.resource);
+                        ui.strong(&r.customer);
+                        ui.label(money(r.total));
+                        ui.label(&r.status);
                     });
-                    ui.collapsing("Estaciones, pagos y acciones", |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                for station in &stations {
-                                    let label = if station.status == "completada"
-                                        && !station.games.is_empty()
-                                    {
-                                        format!("{} · {}", station.resource, station.games)
-                                    } else {
-                                        format!("{} · {}", station.resource, station.status)
-                                    };
-                                    ui.label(
-                                        RichText::new(label)
-                                            .small()
-                                            .color(Color32::from_rgb(148, 179, 195)),
-                                    );
-                                }
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal_wrapped(|ui| {
-                                if canceled {
-                                    ui.label(RichText::new("RESERVA CANCELADA").color(Color32::from_rgb(224, 129, 119)).strong());
-                                } else {
-                                    ui.label(format!("Pagado {} · Saldo {}", money(paid), money(balance)));
-                                }
-                                if !canceled {
-                                    if balance == 0 {
-                                        ui.label(RichText::new("PAGADA").color(Color32::from_rgb(124, 214, 177)).strong());
-                                    } else if paid > 0 {
-                                        ui.label(RichText::new("SEÑA / PAGO PARCIAL").color(Color32::from_rgb(230, 190, 96)));
-                                    } else {
-                                        ui.label(RichText::new("SIN PAGOS").color(Color32::from_rgb(148, 179, 195)));
-                                    }
-                                }
-                            });
-                            if cancellable && editable {
-                                ui.horizontal_wrapped(|ui| {
-                                    if editable && ui.button("Modificar").clicked() { edit = true; }
-                                    if ui.button(if paid > 0 { "Devolver y cancelar" } else { "Cancelar reserva" }).clicked() { cancel = true; }
-                                });
-                            }
-                            if payable {
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.label(if cancellable && paid > 0 { "Cobro o devolución por" } else { "Recibir por" });
-                                    ui.selectable_value(&mut self.reservation_payment_transfer, false, "Efectivo");
-                                    ui.selectable_value(&mut self.reservation_payment_transfer, true, "Transferencia");
-                                    let deposit_target = (total + 1) / 2;
-                                    if paid < deposit_target && ui.button(format!("Registrar seña 50% · {}", money(deposit_target - paid))).clicked() {
-                                        payment_action = Some(reservations::PaymentAction::Deposit);
-                                    }
-                                    if balance > 0 && ui.button(format!("Cobrar saldo · {}", money(balance))).clicked() {
-                                        payment_action = Some(reservations::PaymentAction::Balance);
-                                    }
-                                });
-                                ui.horizontal(|ui| {
-                                    ui.label("Otro pago parcial ($)");
-                                    ui.add_sized([110.0, 28.0], egui::TextEdit::singleline(&mut self.reservation_partial_amount).hint_text("Monto"));
-                                    if balance > 0 && ui.button("Registrar pago").clicked() {
-                                        payment_action = Some(reservations::PaymentAction::Partial);
-                                    }
-                                });
-                            }
-                    });
-                });
-            if edit {
-                self.begin_edit_group(group_id, &stations);
-            } else if cancel {
-                self.pending_cancel = Some((group_id, reservation_id));
-            } else if let Some(action) = payment_action {
-                self.record_reservation_payment(
-                    group_id,
-                    reservation_id,
-                    action,
-                    pesos_input(&self.reservation_partial_amount),
-                );
-                self.reservation_partial_amount.clear();
-            }
-        }
+                }
+            });
     }
     fn ui_sales(&mut self, ui: &mut egui::Ui) {
         ui.label(
@@ -2424,7 +1522,7 @@ impl VrBoxApp {
                         p.stock > in_cart,
                         egui::Button::new(
                             RichText::new(format!(
-                                "BEBIDA\n{}\n{}\nStock {}",
+                                "◈\n{}\n{}\nStock {}",
                                 p.name,
                                 money(p.price),
                                 p.stock
@@ -2506,8 +1604,7 @@ impl VrBoxApp {
                 }
             });
         ui.add_space(16.0);
-        ui.collapsing("Cerrar una sesión reservada", |ui| {
-            ui.label("El pago y la seña se registran por separado en Reservas. Esta acción solo marca el uso y el juego de la estación.");
+        ui.collapsing("Cobrar una sesión reservada", |ui| {
             ui.label("Juego asignado a esta franja");
             ui.horizontal_wrapped(|ui| {
                 for game in std::iter::once("Sin clasificar").chain(GAME_OPTIONS) {
@@ -2527,7 +1624,7 @@ impl VrBoxApp {
                         r.start,
                         money(r.total)
                     ));
-                    if ui.button("Completar sesión").clicked() {
+                    if ui.button("Cobrar y cerrar sesión").clicked() {
                         self.register_session(&r);
                     }
                 });
@@ -2633,211 +1730,7 @@ impl VrBoxApp {
         if ui.button("Guardar tarifas").clicked() {
             self.save_prices();
         }
-        ui.label("Las nuevas reservas toman la tarifa vigente y conservan ese importe. Configurá ofertas por horario en Promociones.");
-    }
-    fn ui_promotions(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("TARIFAS / REGLAS COMERCIALES")
-                .small()
-                .color(Color32::from_rgb(91, 186, 200)),
-        );
-        ui.heading(RichText::new("Promociones automáticas").size(27.0).strong());
-        ui.label("La app elige una sola oferta aplicable, la más conveniente, y descuenta las estaciones de menor valor de cada grupo completo. Horario de fin incluido.");
-        ui.add_space(10.0);
-        ui.label("Nombre de la oferta");
-        ui.add_sized(
-            [320.0, 34.0],
-            egui::TextEdit::singleline(&mut self.promo_name).hint_text("Ej.: Promo tarde"),
-        );
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Mecánica");
-            for (label, buy, pay) in [
-                ("2 por 1", "2", "1"),
-                ("3 por 2", "3", "2"),
-                ("4 por 3", "4", "3"),
-            ] {
-                if ui
-                    .selectable_label(self.promo_buy == buy && self.promo_pay == pay, label)
-                    .clicked()
-                {
-                    self.promo_buy = buy.into();
-                    self.promo_pay = pay.into();
-                }
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Aplicar a");
-            for (label, kind) in [
-                ("Todos", "all"),
-                ("Plata", "sim_silver"),
-                ("Oro", "sim_gold"),
-                ("PS5", "play"),
-                ("VR", "vr"),
-            ] {
-                ui.selectable_value(&mut self.promo_kind, kind.to_string(), label);
-            }
-        });
-        ui.label("Vigencia por hora de inicio de la reserva (ambos extremos incluidos)");
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Desde");
-            for hour in 16..=23 {
-                if ui
-                    .selectable_label(self.promo_start == hour, format!("{hour:02}:00"))
-                    .clicked()
-                {
-                    self.promo_start = hour;
-                    if self.promo_end < hour {
-                        self.promo_end = hour;
-                    }
-                }
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Hasta");
-            for hour in self.promo_start..=23 {
-                if ui
-                    .selectable_label(self.promo_end == hour, format!("{hour:02}:00"))
-                    .clicked()
-                {
-                    self.promo_end = hour;
-                }
-            }
-        });
-        if ui.button("Guardar promoción").clicked() {
-            self.add_promotion();
-        }
-        ui.separator();
-        ui.heading("Promociones activas");
-        for promo in self.promotions() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{} por {} · {} · {:02}:00–{:02}:00 · {}",
-                        promo.buy_qty,
-                        promo.pay_qty,
-                        promo.name,
-                        promo.start_hour,
-                        promo.end_hour,
-                        match promo.resource_kind.as_str() {
-                            "all" => "Todas las estaciones",
-                            "sim_silver" => "Simuladores Plata",
-                            "sim_gold" => "Simuladores Oro",
-                            "play" => "PS5",
-                            "vr" => "VR",
-                            _ => "Categoría",
-                        }
-                    ))
-                    .strong(),
-                );
-                if ui.small_button("Desactivar").clicked() {
-                    match self
-                        .db
-                        .execute("UPDATE promotions SET active=0 WHERE id=?1", [promo.id])
-                    {
-                        Ok(_) => self.message = format!("Promoción '{}' desactivada.", promo.name),
-                        Err(e) => self.message = format!("No se pudo desactivar: {e}"),
-                    }
-                }
-            });
-        }
-        ui.label(RichText::new("Ejemplo: 2 por 1 · Todas · desde 16:00 hasta 19:00 incluye reservas que comienzan a las 16, 17, 18 y 19.").small().color(Color32::from_rgb(148, 179, 195)));
-    }
-    fn ui_timers(&mut self, ui: &mut egui::Ui) {
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
-        ui.label(
-            RichText::new("SEGUIMIENTO EN TIEMPO REAL")
-                .small()
-                .color(Color32::from_rgb(91, 186, 200)),
-        );
-        ui.heading(RichText::new("Cronómetros de juego").size(27.0).strong());
-        ui.label("Iniciá un contador para cada PS5 o puesto de realidad virtual. El aro muestra el tiempo restante y sigue corriendo aunque cierres y abras VRBox.");
-        ui.add_space(12.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Puesto");
-            for (name, _) in RESOURCES
-                .iter()
-                .filter(|(_, kind)| *kind == "play" || *kind == "vr")
-            {
-                ui.selectable_value(&mut self.timer_resource, (*name).to_string(), *name);
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Cliente (opcional)");
-            ui.add_sized(
-                [220.0, 32.0],
-                egui::TextEdit::singleline(&mut self.timer_customer).hint_text("Nombre"),
-            );
-            ui.label("Minutos");
-            ui.add_sized(
-                [80.0, 32.0],
-                egui::TextEdit::singleline(&mut self.timer_minutes),
-            );
-            if ui.button("Iniciar cronómetro").clicked() {
-                self.add_timer();
-            }
-        });
-        ui.separator();
-        let timers = self.game_timers();
-        if timers.is_empty() {
-            ui.add_space(20.0);
-            ui.label(RichText::new("Todavía no hay cronómetros activos. Elegí un puesto y una duración para comenzar.").color(Color32::from_rgb(148, 179, 195)));
-        }
-        egui::Grid::new("timer_cards")
-            .num_columns(2)
-            .spacing(Vec2::new(12.0, 12.0))
-            .show(ui, |ui| {
-                for (index, timer) in timers.iter().enumerate() {
-                    let remaining = timer.ends_at.saturating_sub(Local::now().timestamp());
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(18, 30, 46))
-                        .corner_radius(egui::CornerRadius::same(12))
-                        .inner_margin(egui::Margin::symmetric(12, 10))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                timer_ring(ui, remaining, timer.total_secs);
-                                ui.vertical(|ui| {
-                                    ui.heading(&timer.resource);
-                                    ui.label(if timer.customer.is_empty() {
-                                        "Sin nombre de cliente"
-                                    } else {
-                                        &timer.customer
-                                    });
-                                    let started = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                                        timer.started_at,
-                                        0,
-                                    )
-                                    .map(|d| {
-                                        d.with_timezone(&Local)
-                                            .format("Iniciado a las %H:%M")
-                                            .to_string()
-                                    })
-                                    .unwrap_or_default();
-                                    ui.label(
-                                        RichText::new(started)
-                                            .small()
-                                            .color(Color32::from_rgb(148, 179, 195)),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        if ui.small_button("- 5 min").clicked() {
-                                            self.adjust_timer(timer.id, -5);
-                                        }
-                                        if ui.small_button("+ 5 min").clicked() {
-                                            self.adjust_timer(timer.id, 5);
-                                        }
-                                        if ui.small_button("Eliminar").clicked() {
-                                            self.delete_timer(timer.id);
-                                        }
-                                    });
-                                });
-                            });
-                        });
-                    if index % 2 == 1 {
-                        ui.end_row();
-                    }
-                }
-            });
-        ui.add_space(8.0);
-        ui.label(RichText::new("Los botones de ajuste modifican el vencimiento en 5 minutos. Los cronómetros finalizados quedan visibles hasta que se eliminen; sumar tiempo puede reactivarlos.").small().color(Color32::from_rgb(148, 179, 195)));
+        ui.label("Las nuevas reservas toman la tarifa vigente y conservan ese importe. Las ofertas y descuentos configurables vuelven en una próxima etapa.");
     }
     fn ui_closing(&mut self, ui: &mut egui::Ui) {
         ui.heading(format!("Cierre de caja · {}", self.day));
