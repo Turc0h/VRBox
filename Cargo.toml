@@ -1,0 +1,20 @@
+[package]
+name = "vrbox"
+version = "0.1.0"
+edition = "2024"
+description = "Control local de reservas, ventas, stock y caja para un centro de gaming"
+
+[dependencies]
+calamine = "0.36.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+eframe = { version = "0.34.3", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+rfd = "0.17.2"
+rusqlite = { version = "0.40.1", features = ["bundled", "chrono"] }
+rust_xlsxwriter = "0.99.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
